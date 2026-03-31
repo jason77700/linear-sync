@@ -9,13 +9,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// DB connection
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// DB connection — use SSL for RDS, set search_path to linear_sync schema
+const pgConfig = { connectionString: process.env.DATABASE_URL };
+if (process.env.DATABASE_URL?.includes('rds.amazonaws.com')) {
+  pgConfig.ssl = { rejectUnauthorized: false };
+}
+const pool = new Pool(pgConfig);
 
-// Init schema
+// Init schema — create linear_sync schema + tables within it
 async function initDB() {
+  await pool.query(`CREATE SCHEMA IF NOT EXISTS linear_sync`);
+  await pool.query(`SET search_path TO linear_sync`);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS linear_projects (
+    CREATE TABLE IF NOT EXISTS linear_sync.linear_projects (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       description TEXT,
@@ -27,7 +33,7 @@ async function initDB() {
       synced_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS linear_issues (
+    CREATE TABLE IF NOT EXISTS linear_sync.linear_issues (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
@@ -47,7 +53,7 @@ async function initDB() {
       synced_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS sync_log (
+    CREATE TABLE IF NOT EXISTS linear_sync.sync_log (
       id SERIAL PRIMARY KEY,
       started_at TIMESTAMPTZ DEFAULT NOW(),
       completed_at TIMESTAMPTZ,
@@ -124,6 +130,7 @@ const syncJobs = {};
 async function runSync(syncId) {
   const client = await pool.connect();
   try {
+    await client.query('SET search_path TO linear_sync');
     syncJobs[syncId] = { status: 'running', progress: 'Fetching projects...' };
 
     // Fetch projects
@@ -132,7 +139,7 @@ async function runSync(syncId) {
 
     for (const p of projects) {
       await client.query(`
-        INSERT INTO linear_projects (id, name, description, color, state, url, created_at, updated_at, synced_at)
+        INSERT INTO linear_sync.linear_projects (id, name, description, color, state, url, created_at, updated_at, synced_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
         ON CONFLICT (id) DO UPDATE SET
           name=EXCLUDED.name, description=EXCLUDED.description, color=EXCLUDED.color,
@@ -141,7 +148,7 @@ async function runSync(syncId) {
     }
 
     // Update sync log
-    await client.query(`UPDATE sync_log SET projects_synced=$1 WHERE id=$2`, [projects.length, syncId]);
+    await client.query(`UPDATE linear_sync.sync_log SET projects_synced=$1 WHERE id=$2`, [projects.length, syncId]);
 
     // Fetch issues
     syncJobs[syncId].progress = 'Fetching issues...';
@@ -150,7 +157,7 @@ async function runSync(syncId) {
 
     for (const issue of issues) {
       await client.query(`
-        INSERT INTO linear_issues (id, title, description, url, priority, state_name, state_type, state_color,
+        INSERT INTO linear_sync.linear_issues (id, title, description, url, priority, state_name, state_type, state_color,
           assignee_name, assignee_email, team_name, team_key, project_id, labels, created_at, updated_at, synced_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
         ON CONFLICT (id) DO UPDATE SET
@@ -173,14 +180,16 @@ async function runSync(syncId) {
 
     // Complete
     await client.query(`
-      UPDATE sync_log SET completed_at=NOW(), issues_synced=$1, projects_synced=$2, status='completed'
+      UPDATE linear_sync.sync_log SET completed_at=NOW(), issues_synced=$1, projects_synced=$2, status='completed'
       WHERE id=$3
     `, [issues.length, projects.length, syncId]);
 
     syncJobs[syncId] = { status: 'completed', issues: issues.length, projects: projects.length };
   } catch (err) {
     console.error('Sync error:', err);
-    await client.query(`UPDATE sync_log SET completed_at=NOW(), status='error', error=$1 WHERE id=$2`, [err.message, syncId]);
+    try {
+      await client.query(`UPDATE linear_sync.sync_log SET completed_at=NOW(), status='error', error=$1 WHERE id=$2`, [err.message, syncId]);
+    } catch {}
     syncJobs[syncId] = { status: 'error', error: err.message };
   } finally {
     client.release();
@@ -195,9 +204,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/api/stats', async (req, res) => {
   try {
     const [issuesRes, projectsRes, lastSync] = await Promise.all([
-      pool.query('SELECT COUNT(*) FROM linear_issues'),
-      pool.query('SELECT COUNT(*) FROM linear_projects'),
-      pool.query(`SELECT * FROM sync_log WHERE status='completed' ORDER BY completed_at DESC LIMIT 1`),
+      pool.query('SELECT COUNT(*) FROM linear_sync.linear_issues'),
+      pool.query('SELECT COUNT(*) FROM linear_sync.linear_projects'),
+      pool.query(`SELECT * FROM linear_sync.sync_log WHERE status='completed' ORDER BY completed_at DESC LIMIT 1`),
     ]);
     res.json({
       totalIssues: parseInt(issuesRes.rows[0].count),
@@ -220,13 +229,13 @@ app.get('/api/issues', async (req, res) => {
     params.push(limit, offset);
     const result = await pool.query(`
       SELECT i.*, p.name as project_name, p.color as project_color
-      FROM linear_issues i
-      LEFT JOIN linear_projects p ON i.project_id = p.id
+      FROM linear_sync.linear_issues i
+      LEFT JOIN linear_sync.linear_projects p ON i.project_id = p.id
       ${where}
       ORDER BY i.updated_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
-    const countResult = await pool.query(`SELECT COUNT(*) FROM linear_issues i ${where}`, params.slice(0, -2));
+    const countResult = await pool.query(`SELECT COUNT(*) FROM linear_sync.linear_issues i ${where}`, params.slice(0, -2));
     res.json({ issues: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -235,8 +244,8 @@ app.get('/api/projects', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT p.*, COUNT(i.id) as issue_count
-      FROM linear_projects p
-      LEFT JOIN linear_issues i ON i.project_id = p.id
+      FROM linear_sync.linear_projects p
+      LEFT JOIN linear_sync.linear_issues i ON i.project_id = p.id
       GROUP BY p.id
       ORDER BY p.updated_at DESC
     `);
@@ -246,14 +255,14 @@ app.get('/api/projects', async (req, res) => {
 
 app.get('/api/sync-log', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 10');
+    const result = await pool.query('SELECT * FROM linear_sync.sync_log ORDER BY started_at DESC LIMIT 10');
     res.json({ logs: result.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/sync', async (req, res) => {
   try {
-    const result = await pool.query(`INSERT INTO sync_log (status) VALUES ('running') RETURNING id`);
+    const result = await pool.query(`INSERT INTO linear_sync.sync_log (status) VALUES ('running') RETURNING id`);
     const syncId = result.rows[0].id;
     runSync(syncId); // async, don't await
     res.json({ syncId, status: 'started' });
@@ -263,13 +272,15 @@ app.post('/api/sync', async (req, res) => {
 app.get('/api/sync/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    // Check in-memory first for live progress
     if (syncJobs[id]) return res.json(syncJobs[id]);
-    const result = await pool.query('SELECT * FROM sync_log WHERE id=$1', [id]);
+    const result = await pool.query('SELECT * FROM linear_sync.sync_log WHERE id=$1', [id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Health check
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // Start
 initDB().then(() => {
