@@ -62,6 +62,30 @@ async function initDB() {
       status TEXT DEFAULT 'running',
       error TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS linear_sync.linear_prs (
+      id TEXT PRIMARY KEY,
+      issue_id TEXT,
+      issue_title TEXT,
+      team_name TEXT,
+      title TEXT,
+      url TEXT,
+      number INT,
+      status TEXT,
+      draft BOOLEAN DEFAULT FALSE,
+      branch TEXT,
+      target_branch TEXT,
+      repo_name TEXT,
+      repo_login TEXT,
+      author_login TEXT,
+      link_kind TEXT,
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ,
+      merged_at TIMESTAMPTZ,
+      closed_at TIMESTAMPTZ,
+      reviews JSONB DEFAULT '[]',
+      synced_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   console.log('✅ DB schema ready');
 }
@@ -124,6 +148,23 @@ const ISSUES_QUERY = `
   }
 `;
 
+const PRS_QUERY = `
+  query PRs($after: String) {
+    issues(first: 50, after: $after, filter: {attachments: {some: {sourceType: {eq: "github"}}}}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id title
+        team { name }
+        attachments(filter: {sourceType: {eq: "github"}}) {
+          nodes {
+            id title url sourceType metadata
+          }
+        }
+      }
+    }
+  }
+`;
+
 // Active sync jobs
 const syncJobs = {};
 
@@ -178,13 +219,48 @@ async function runSync(syncId) {
       ]);
     }
 
+    // Fetch PRs (via issue attachments)
+    syncJobs[syncId].progress = 'Fetching pull requests...';
+    const prIssues = await fetchAllPages(PRS_QUERY, 'issues');
+    let prCount = 0;
+    for (const issue of prIssues) {
+      for (const att of (issue.attachments?.nodes || [])) {
+        if (att.sourceType !== 'github') continue;
+        const m = att.metadata || {};
+        await client.query(`
+          INSERT INTO linear_sync.linear_prs
+            (id, issue_id, issue_title, team_name, title, url, number, status, draft, branch, target_branch,
+             repo_name, repo_login, author_login, link_kind, created_at, updated_at, merged_at, closed_at, reviews, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
+          ON CONFLICT (id) DO UPDATE SET
+            issue_id=EXCLUDED.issue_id, issue_title=EXCLUDED.issue_title, team_name=EXCLUDED.team_name,
+            title=EXCLUDED.title, url=EXCLUDED.url, number=EXCLUDED.number, status=EXCLUDED.status,
+            draft=EXCLUDED.draft, branch=EXCLUDED.branch, target_branch=EXCLUDED.target_branch,
+            repo_name=EXCLUDED.repo_name, repo_login=EXCLUDED.repo_login, author_login=EXCLUDED.author_login,
+            link_kind=EXCLUDED.link_kind, updated_at=EXCLUDED.updated_at, merged_at=EXCLUDED.merged_at,
+            closed_at=EXCLUDED.closed_at, reviews=EXCLUDED.reviews, synced_at=NOW()
+        `, [
+          att.id, issue.id, issue.title, issue.team?.name,
+          m.title || att.title, m.url || att.url,
+          m.number, m.status, m.draft || false,
+          m.branch, m.targetBranch,
+          m.repoName, m.repoLogin, m.userLogin,
+          m.linkKind,
+          m.createdAt, m.updatedAt, m.mergedAt, m.closedAt,
+          JSON.stringify(m.reviews || []),
+        ]);
+        prCount++;
+      }
+    }
+    syncJobs[syncId].progress = `Synced ${prCount} PRs...`;
+
     // Complete
     await client.query(`
       UPDATE linear_sync.sync_log SET completed_at=NOW(), issues_synced=$1, projects_synced=$2, status='completed'
       WHERE id=$3
     `, [issues.length, projects.length, syncId]);
 
-    syncJobs[syncId] = { status: 'completed', issues: issues.length, projects: projects.length };
+    syncJobs[syncId] = { status: 'completed', issues: issues.length, projects: projects.length, prs: prCount };
   } catch (err) {
     console.error('Sync error:', err);
     try {
@@ -279,6 +355,86 @@ app.get('/api/sync/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+app.get('/api/prs', async (req, res) => {
+  try {
+    const { search, repo, status, team, page = 1 } = req.query;
+    const limit = 50;
+    const offset = (page - 1) * limit;
+    let where = 'WHERE 1=1';
+    const params = [];
+    if (search) { params.push(`%${search}%`); where += ` AND (pr.title ILIKE $${params.length} OR pr.issue_title ILIKE $${params.length} OR pr.author_login ILIKE $${params.length})`; }
+    if (repo) { params.push(repo); where += ` AND pr.repo_name = $${params.length}`; }
+    if (status) { params.push(status); where += ` AND pr.status = $${params.length}`; }
+    if (team) { params.push(team); where += ` AND pr.team_name = $${params.length}`; }
+    params.push(limit, offset);
+    const result = await pool.query(`
+      SELECT pr.*
+      FROM linear_sync.linear_prs pr
+      ${where}
+      ORDER BY pr.updated_at DESC NULLS LAST
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params);
+    const countResult = await pool.query(`SELECT COUNT(*) FROM linear_sync.linear_prs pr ${where}`, params.slice(0, -2));
+    res.json({ prs: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/pr-stats', async (req, res) => {
+  try {
+    const [statusRes, repoRes, authorRes, teamRes, linkKindRes, weeklyRes] = await Promise.all([
+      pool.query(`SELECT status, COUNT(*) as count FROM linear_sync.linear_prs GROUP BY status ORDER BY count DESC`),
+      pool.query(`SELECT repo_name, repo_login, COUNT(*) as total,
+        SUM(CASE WHEN status='merged' THEN 1 ELSE 0 END) as merged,
+        SUM(CASE WHEN status='open' OR status='inReview' THEN 1 ELSE 0 END) as open
+        FROM linear_sync.linear_prs WHERE repo_name IS NOT NULL
+        GROUP BY repo_name, repo_login ORDER BY total DESC LIMIT 10`),
+      pool.query(`SELECT author_login, COUNT(*) as total,
+        SUM(CASE WHEN status='merged' THEN 1 ELSE 0 END) as merged,
+        SUM(CASE WHEN status='open' OR status='inReview' THEN 1 ELSE 0 END) as open
+        FROM linear_sync.linear_prs WHERE author_login IS NOT NULL
+        GROUP BY author_login ORDER BY total DESC LIMIT 12`),
+      pool.query(`SELECT team_name, COUNT(*) as total,
+        SUM(CASE WHEN status='merged' THEN 1 ELSE 0 END) as merged
+        FROM linear_sync.linear_prs WHERE team_name IS NOT NULL
+        GROUP BY team_name ORDER BY total DESC LIMIT 10`),
+      pool.query(`SELECT link_kind, COUNT(*) as count FROM linear_sync.linear_prs GROUP BY link_kind ORDER BY count DESC`),
+      pool.query(`
+        WITH weeks AS (
+          SELECT generate_series(date_trunc('week', NOW()) - INTERVAL '11 weeks', date_trunc('week', NOW()), '1 week') AS week_start
+        )
+        SELECT
+          to_char(w.week_start, 'Mon DD') as week_label,
+          COUNT(CASE WHEN date_trunc('week', pr.created_at) = w.week_start THEN 1 END) as opened,
+          COUNT(CASE WHEN date_trunc('week', pr.merged_at) = w.week_start THEN 1 END) as merged
+        FROM weeks w LEFT JOIN linear_sync.linear_prs pr ON true
+        GROUP BY w.week_start ORDER BY w.week_start
+      `),
+    ]);
+
+    const summary = await pool.query(`
+      SELECT
+        COUNT(*) as total,
+        COUNT(*) FILTER (WHERE status IN ('open','inReview')) as open,
+        COUNT(*) FILTER (WHERE status = 'merged') as merged,
+        COUNT(*) FILTER (WHERE status = 'closed') as closed,
+        COUNT(*) FILTER (WHERE draft = true) as drafts,
+        ROUND(AVG(CASE WHEN merged_at IS NOT NULL AND created_at IS NOT NULL
+          THEN EXTRACT(EPOCH FROM (merged_at - created_at)) / 3600 END)::numeric, 1) as avg_merge_hours
+      FROM linear_sync.linear_prs
+    `);
+
+    res.json({
+      byStatus: statusRes.rows,
+      byRepo: repoRes.rows,
+      byAuthor: authorRes.rows,
+      byTeam: teamRes.rows,
+      byLinkKind: linkKindRes.rows,
+      weekly: weeklyRes.rows,
+      summary: summary.rows[0],
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/insights', async (req, res) => {
   try {
