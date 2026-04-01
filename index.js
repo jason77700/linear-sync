@@ -279,6 +279,119 @@ app.get('/api/sync/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+app.get('/api/insights', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    await client.query('SET search_path TO linear_sync');
+    try {
+      const [stateRes, priorityRes, teamRes, assigneeRes, labelRes, velocityRes, ageRes, summaryRes, projectStateRes] = await Promise.all([
+        // Issues by state
+        client.query(`
+          SELECT state_name, state_type, state_color, COUNT(*) as count
+          FROM linear_sync.linear_issues
+          GROUP BY state_name, state_type, state_color
+          ORDER BY count DESC
+        `),
+        // Issues by priority
+        client.query(`
+          SELECT priority, COUNT(*) as count
+          FROM linear_sync.linear_issues
+          GROUP BY priority
+          ORDER BY priority ASC
+        `),
+        // Issues by team
+        client.query(`
+          SELECT team_name, COUNT(*) as total,
+            SUM(CASE WHEN state_type IN ('completed','cancelled') THEN 1 ELSE 0 END) as closed,
+            SUM(CASE WHEN state_type NOT IN ('completed','cancelled') THEN 1 ELSE 0 END) as open
+          FROM linear_sync.linear_issues
+          WHERE team_name IS NOT NULL
+          GROUP BY team_name
+          ORDER BY total DESC
+          LIMIT 15
+        `),
+        // Top assignees by open workload
+        client.query(`
+          SELECT assignee_name, COUNT(*) as total,
+            SUM(CASE WHEN state_type NOT IN ('completed','cancelled') THEN 1 ELSE 0 END) as open
+          FROM linear_sync.linear_issues
+          WHERE assignee_name IS NOT NULL
+          GROUP BY assignee_name
+          ORDER BY open DESC, total DESC
+          LIMIT 12
+        `),
+        // Top labels
+        client.query(`
+          SELECT label->>'name' as name, label->>'color' as color, COUNT(*) as count
+          FROM linear_sync.linear_issues,
+               jsonb_array_elements(labels) as label
+          GROUP BY label->>'name', label->>'color'
+          ORDER BY count DESC
+          LIMIT 15
+        `),
+        // Weekly velocity: created vs closed for last 12 weeks
+        client.query(`
+          WITH weeks AS (
+            SELECT generate_series(
+              date_trunc('week', NOW()) - INTERVAL '11 weeks',
+              date_trunc('week', NOW()),
+              '1 week'
+            ) AS week_start
+          )
+          SELECT
+            to_char(w.week_start, 'Mon DD') as week_label,
+            COUNT(CASE WHEN date_trunc('week', i.created_at) = w.week_start THEN 1 END) as created,
+            COUNT(CASE WHEN i.state_type IN ('completed','cancelled') AND date_trunc('week', i.updated_at) = w.week_start THEN 1 END) as closed
+          FROM weeks w
+          LEFT JOIN linear_sync.linear_issues i ON true
+          GROUP BY w.week_start
+          ORDER BY w.week_start ASC
+        `),
+        // Age of open issues
+        client.query(`
+          SELECT
+            ROUND(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400)::numeric, 1) as avg_age_days,
+            ROUND(MAX(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400)::numeric, 0) as max_age_days,
+            COUNT(*) as open_count
+          FROM linear_sync.linear_issues
+          WHERE state_type NOT IN ('completed','cancelled')
+        `),
+        // Summary counts
+        client.query(`
+          SELECT
+            COUNT(*) FILTER (WHERE assignee_name IS NULL AND state_type NOT IN ('completed','cancelled')) as unassigned_open,
+            COUNT(*) FILTER (WHERE state_type NOT IN ('completed','cancelled')) as total_open,
+            COUNT(*) FILTER (WHERE priority = 1 AND state_type NOT IN ('completed','cancelled')) as urgent_open,
+            COUNT(*) as total
+          FROM linear_sync.linear_issues
+        `),
+        // Projects by state
+        client.query(`
+          SELECT state, COUNT(*) as count
+          FROM linear_sync.linear_projects
+          GROUP BY state
+          ORDER BY count DESC
+        `),
+      ]);
+
+      res.json({
+        byState: stateRes.rows,
+        byPriority: priorityRes.rows,
+        byTeam: teamRes.rows,
+        byAssignee: assigneeRes.rows,
+        topLabels: labelRes.rows,
+        velocity: velocityRes.rows,
+        issueAge: ageRes.rows[0],
+        summary: summaryRes.rows[0],
+        projectsByState: projectStateRes.rows,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 

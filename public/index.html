@@ -89,6 +89,10 @@
       class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 -mb-px transition-colors">
       📁 Projects
     </button>
+    <button onclick="switchTab('stats')" id="tab-stats-btn"
+      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 -mb-px transition-colors">
+      📊 Stats
+    </button>
   </div>
 
   <!-- Issues Tab -->
@@ -142,6 +146,76 @@
     </div>
   </div>
 
+
+  <!-- Stats Tab -->
+  <div id="tab-stats" class="tab-content hidden">
+    <!-- KPI cards -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Open Issues</div>
+        <div class="text-2xl font-bold text-gray-100" id="kpi-open">—</div>
+      </div>
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Unassigned Open</div>
+        <div class="text-2xl font-bold text-yellow-400" id="kpi-unassigned">—</div>
+      </div>
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Urgent Open</div>
+        <div class="text-2xl font-bold text-red-400" id="kpi-urgent">—</div>
+      </div>
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Avg Issue Age</div>
+        <div class="text-2xl font-bold text-indigo-400" id="kpi-age">—</div>
+        <div class="text-xs text-gray-500 mt-0.5" id="kpi-age-sub"></div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-5">
+        <div class="text-sm font-semibold text-gray-300 mb-4">Issues by State</div>
+        <div id="chart-states" class="space-y-2"></div>
+      </div>
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-5">
+        <div class="text-sm font-semibold text-gray-300 mb-4">Issues by Priority</div>
+        <div id="chart-priority" class="space-y-2"></div>
+      </div>
+    </div>
+
+    <div class="bg-gray-900 border border-gray-700 rounded-xl p-5 mb-5">
+      <div class="text-sm font-semibold text-gray-300 mb-1">Weekly Velocity</div>
+      <div class="text-xs text-gray-500 mb-4">Issues created vs. closed per week (last 12 weeks)</div>
+      <div id="chart-velocity" class="flex items-end gap-1 h-28"></div>
+      <div id="chart-velocity-labels" class="flex gap-1 mt-1 text-xs text-gray-600"></div>
+      <div class="flex gap-4 mt-3 text-xs">
+        <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm bg-indigo-600 inline-block"></span>Created</span>
+        <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm bg-emerald-600 inline-block"></span>Closed</span>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-5">
+        <div class="text-sm font-semibold text-gray-300 mb-4">Issues by Team</div>
+        <div id="chart-teams" class="space-y-3"></div>
+      </div>
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-5">
+        <div class="text-sm font-semibold text-gray-300 mb-1">Assignee Workload</div>
+        <div class="text-xs text-gray-500 mb-4">Open issues per person</div>
+        <div id="chart-assignees" class="space-y-2"></div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-5">
+        <div class="text-sm font-semibold text-gray-300 mb-4">Top Labels</div>
+        <div id="chart-labels" class="flex flex-wrap gap-2"></div>
+      </div>
+      <div class="bg-gray-900 border border-gray-700 rounded-xl p-5">
+        <div class="text-sm font-semibold text-gray-300 mb-4">Projects by Status</div>
+        <div id="chart-project-states" class="space-y-2"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Sync Log -->
   <div class="mt-8">
     <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Sync History</div>
@@ -176,7 +250,7 @@ let searchTimer = null;
 let activeSyncId = null;
 
 function switchTab(tab) {
-  ['issues', 'projects'].forEach(t => {
+  ['issues', 'projects', 'stats'].forEach(t => {
     document.getElementById(`tab-${t}`).classList.toggle('hidden', t !== tab);
     const btn = document.getElementById(`tab-${t}-btn`);
     if (t === tab) {
@@ -187,6 +261,7 @@ function switchTab(tab) {
       btn.classList.replace('text-indigo-400', 'text-gray-400');
     }
   });
+  if (tab === 'stats' && !window._statsLoaded) { loadInsights(); window._statsLoaded = true; }
 }
 
 function debounceSearch() {
@@ -424,6 +499,94 @@ function resetBtn() {
   document.getElementById('btnIcon').classList.remove('hidden');
   document.getElementById('btnSpinner').classList.add('hidden');
   document.getElementById('btnLabel').textContent = 'Sync Now';
+}
+
+
+async function loadInsights() {
+  const d = await fetch('/api/insights').then(r => r.json());
+  if (d.error) { console.error('Insights error:', d.error); return; }
+
+  const s = d.summary || {};
+  document.getElementById('kpi-open').textContent = Number(s.total_open || 0).toLocaleString();
+  document.getElementById('kpi-unassigned').textContent = Number(s.unassigned_open || 0).toLocaleString();
+  document.getElementById('kpi-urgent').textContent = Number(s.urgent_open || 0).toLocaleString();
+  const age = d.issueAge || {};
+  document.getElementById('kpi-age').textContent = age.avg_age_days ? `${age.avg_age_days}d` : '—';
+  document.getElementById('kpi-age-sub').textContent = age.max_age_days ? `oldest: ${age.max_age_days}d` : '';
+
+  function barChart(containerId, rows, labelKey, valueKey, colorFn) {
+    const el = document.getElementById(containerId);
+    if (!rows || !rows.length) { el.innerHTML = '<div class="text-xs text-gray-500">No data</div>'; return; }
+    const max = Math.max(...rows.map(r => Number(r[valueKey])), 1);
+    el.innerHTML = rows.map(r => {
+      const val = Number(r[valueKey]);
+      const pct = Math.round((val / max) * 100);
+      const color = colorFn(r);
+      return `<div class="flex items-center gap-2 text-xs">
+        <div class="w-28 text-gray-400 truncate flex-shrink-0">${r[labelKey] || '—'}</div>
+        <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+          <div class="h-2 rounded-full" style="width:${pct}%;background:${color}"></div>
+        </div>
+        <div class="w-8 text-right text-gray-400 flex-shrink-0">${val}</div>
+      </div>`;
+    }).join('');
+  }
+
+  const stateTypeColors = { completed:'#26b5a0', cancelled:'#6b6b8a', started:'#5e6ad2', backlog:'#555b75', unstarted:'#8b90a8' };
+  barChart('chart-states', d.byState, 'state_name', 'count',
+    r => r.state_color || stateTypeColors[r.state_type] || '#5e6ad2');
+
+  const priMap = {0:{label:'No Priority',color:'#555b75'},1:{label:'Urgent',color:'#e05252'},2:{label:'High',color:'#f0a030'},3:{label:'Medium',color:'#5e6ad2'},4:{label:'Low',color:'#8b90a8'}};
+  const priRows = (d.byPriority||[]).map(r => ({...r, label: priMap[r.priority]?.label||'Unknown'}));
+  barChart('chart-priority', priRows, 'label', 'count', r => priMap[r.priority]?.color||'#5e6ad2');
+
+  const teamsEl = document.getElementById('chart-teams');
+  if (d.byTeam?.length) {
+    const maxT = Math.max(...d.byTeam.map(r => Number(r.total)), 1);
+    teamsEl.innerHTML = d.byTeam.map(r => {
+      const openPct = Math.round((Number(r.open) / maxT) * 100);
+      const closedPct = Math.round((Number(r.closed) / maxT) * 100);
+      return `<div class="text-xs mb-1">
+        <div class="flex items-center justify-between mb-0.5">
+          <span class="text-gray-400 truncate w-32">${r.team_name}</span>
+          <span class="text-gray-500">${r.open} open · ${r.closed} closed</span>
+        </div>
+        <div class="flex gap-0.5 h-2 rounded overflow-hidden bg-gray-800">
+          <div style="width:${openPct}%;background:#5e6ad2"></div>
+          <div style="width:${closedPct}%;background:#26b5a0"></div>
+        </div>
+      </div>`;
+    }).join('');
+  } else teamsEl.innerHTML = '<div class="text-xs text-gray-500">No data</div>';
+
+  barChart('chart-assignees', d.byAssignee||[], 'assignee_name', 'open', () => '#5e6ad2');
+
+  const velEl = document.getElementById('chart-velocity');
+  const velLabels = document.getElementById('chart-velocity-labels');
+  const vel = d.velocity || [];
+  if (vel.length) {
+    const maxV = Math.max(...vel.map(r => Math.max(Number(r.created), Number(r.closed))), 1);
+    velEl.innerHTML = vel.map(r => {
+      const cp = Math.max(2, Math.round((Number(r.created) / maxV) * 100));
+      const dp = Math.max(2, Math.round((Number(r.closed) / maxV) * 100));
+      return `<div class="flex-1 flex gap-0.5 items-end h-full">
+        <div class="flex-1 rounded-t bg-indigo-600 transition-all" style="height:${Number(r.created)?cp:0}%" title="Created: ${r.created}"></div>
+        <div class="flex-1 rounded-t bg-emerald-600 transition-all" style="height:${Number(r.closed)?dp:0}%" title="Closed: ${r.closed}"></div>
+      </div>`;
+    }).join('');
+    velLabels.innerHTML = vel.map(r => `<div class="flex-1 text-center truncate">${r.week_label}</div>`).join('');
+  }
+
+  const labelsEl = document.getElementById('chart-labels');
+  labelsEl.innerHTML = (d.topLabels||[]).map(l => {
+    const c = l.color || '#5e6ad2';
+    const r2 = parseInt(c.slice(1,3),16), g = parseInt(c.slice(3,5),16), b = parseInt(c.slice(5,7),16);
+    return `<span class="text-xs font-medium px-2.5 py-1 rounded-full cursor-default" style="background:rgba(${r2},${g},${b},0.15);color:${c};border:1px solid rgba(${r2},${g},${b},0.3)">${l.name} <span style="opacity:0.6">${l.count}</span></span>`;
+  }).join('') || '<div class="text-xs text-gray-500">No labels</div>';
+
+  const projColors = {planned:'#8b90a8',started:'#5e6ad2',paused:'#f0a030',completed:'#26b5a0',cancelled:'#e05252'};
+  barChart('chart-project-states', d.projectsByState||[], 'state', 'count',
+    r => projColors[(r.state||'').toLowerCase()] || '#8b90a8');
 }
 
 (async () => {
